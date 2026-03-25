@@ -147,7 +147,7 @@ SecurityEvent
 
 ## 💰 Get the Full Pack (23 Rules + Docs)
 
-**[→ Buy on Gumroad](https://gumroad.com)** — €39
+**[→ Buy on Gumroad]((https://ismaelggm.gumroad.com/l/lhteh))** — €39
 
 Includes all 23 rules + MITRE mapping + deployment guide + audit policy setup + FP reduction guide + 5 incident response playbooks.
 
