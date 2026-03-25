@@ -1,0 +1,194 @@
+// ============================================================
+// RULE: DE-001 — Security Event Log Cleared
+// ============================================================
+// MITRE ATT&CK:  T1070.001 — Indicator Removal: Clear Windows Event Logs
+// Severity:      🔴 HIGH
+// Data Source:   Security Events (Event ID 1102, 104)
+// Frequency:     Every 15 minutes | Lookback: 1 hour
+// Author:        Ismael Gaton
+// Description:
+//   Detects when the Security or System event log is cleared.
+//   This is almost always a sign of an attacker covering their
+//   tracks. Legitimate admins almost never need to clear logs
+//   in an SME environment.
+// ============================================================
+
+SecurityEvent
+| where TimeGenerated > ago(1h)
+| where EventID in (
+    1102,  // Security audit log cleared
+    104    // System log cleared
+)
+| extend
+    AlertTitle = "Windows event log cleared — possible attacker covering tracks",
+    Severity = "High",
+    MITRE = "T1070.001"
+| project
+    TimeGenerated,
+    Computer,
+    AccountName,
+    Activity,
+    EventID,
+    AlertTitle,
+    Severity,
+    MITRE
+
+// ============================================================
+// TUNING NOTES:
+//   - Extremely low FP rate. Log clearing is almost never legitimate.
+//   - If your SOC has a process to clear logs (e.g., before
+//     decommissioning), exclude specific computers or timeframes.
+//
+// RESPONSE:
+//   1. IMMEDIATELY — check what was logged before the clear
+//     (look at Sentinel ingested events, not the local log)
+//   2. Identify who cleared the log and from which process
+//   3. Treat the machine as compromised
+//   4. Check other machines for similar activity — this is
+//     often done across multiple hosts simultaneously
+// ============================================================
+
+
+// ============================================================
+// RULE: DE-002 — Windows Defender Tampered or Disabled
+// ============================================================
+// MITRE ATT&CK:  T1562.001 — Impair Defenses: Disable or Modify Tools
+// Severity:      🔴 HIGH
+// Data Source:   DeviceEvents, SecurityAlert
+// Frequency:     Every 15 minutes | Lookback: 1 hour
+// Author:        Ismael Gaton
+// Description:
+//   Detects attempts to disable or tamper with Windows Defender.
+//   Malware routinely disables AV before executing its payload.
+//   In SME environments without a separate EDR, Defender is the
+//   last line of defense — its disabling is critical to detect.
+// ============================================================
+
+union
+(
+    // Defender disabled via PowerShell
+    DeviceProcessEvents
+    | where TimeGenerated > ago(1h)
+    | where FileName =~ "powershell.exe"
+    | where ProcessCommandLine has_any (
+        "Set-MpPreference -DisableRealtimeMonitoring $true",
+        "Set-MpPreference -DisableIOAVProtection $true",
+        "Set-MpPreference -DisableBehaviorMonitoring $true",
+        "DisableAntiSpyware",
+        "Add-MpPreference -ExclusionPath"
+    )
+    | extend Source = "PowerShell Defender tamper"
+),
+(
+    // Defender service stopped
+    DeviceProcessEvents
+    | where TimeGenerated > ago(1h)
+    | where FileName =~ "sc.exe"
+    | where ProcessCommandLine has_any ("WinDefend", "SecurityHealthService", "wscsvc")
+    | where ProcessCommandLine has_any ("stop", "delete", "config", "disabled")
+    | extend Source = "SC.exe Defender tamper"
+),
+(
+    // Registry tamper to disable Defender
+    DeviceRegistryEvents
+    | where TimeGenerated > ago(1h)
+    | where RegistryKey has "Windows Defender"
+    | where RegistryValueName in~ ("DisableAntiSpyware", "DisableRealtimeMonitoring", "DisableBehaviorMonitoring")
+    | where RegistryValueData == "1"
+    | extend Source = "Registry Defender tamper", FileName = InitiatingProcessFileName,
+        ProcessCommandLine = InitiatingProcessCommandLine, AccountName = InitiatingProcessAccountName
+)
+| extend
+    AlertTitle = "Windows Defender disabled or tampered — possible pre-attack preparation",
+    Severity = "High",
+    MITRE = "T1562.001"
+| project
+    TimeGenerated,
+    DeviceName,
+    AccountName,
+    FileName,
+    ProcessCommandLine,
+    Source,
+    AlertTitle,
+    Severity,
+    MITRE
+
+// ============================================================
+// TUNING NOTES:
+//   - Legitimate use case: IT adding exclusion for a known false
+//     positive (e.g., a business app flagged by Defender).
+//     This SHOULD be investigated even if later confirmed legit.
+//   - Enterprise AV migration may trigger this — coordinate
+//     with IT during AV tool transitions
+//
+// RESPONSE:
+//   1. Immediately check if Defender is still running on that host
+//   2. Re-enable Defender remotely if possible
+//   3. Run a full scan on the device
+//   4. Check what ran on that device in the 30 minutes after tampering
+// ============================================================
+
+
+// ============================================================
+// RULE: DE-003 — Suspicious Process Masquerading as System Process
+// ============================================================
+// MITRE ATT&CK:  T1036.005 — Masquerading: Match Legitimate Name or Location
+// Severity:      🟡 MEDIUM
+// Data Source:   DeviceProcessEvents
+// Frequency:     Every 1 hour | Lookback: 2 hours
+// Author:        Ismael Gaton
+// Description:
+//   Detects processes using names of legitimate Windows system
+//   binaries but running from non-standard locations.
+//   e.g., svchost.exe running from C:\Users\Public\ instead of
+//   C:\Windows\System32\ — a classic malware masquerading technique.
+// ============================================================
+
+let SystemProcesses = dynamic([
+    "svchost.exe", "lsass.exe", "csrss.exe", "winlogon.exe",
+    "services.exe", "smss.exe", "explorer.exe", "taskhost.exe",
+    "wininit.exe", "spoolsv.exe", "SearchIndexer.exe"
+]);
+
+let LegitPaths = dynamic([
+    @"C:\Windows\System32\",
+    @"C:\Windows\SysWOW64\",
+    @"C:\Windows\",
+    @"C:\Program Files\",
+    @"C:\Program Files (x86)\"
+]);
+
+DeviceProcessEvents
+| where TimeGenerated > ago(2h)
+| where FileName in~ (SystemProcesses)
+| where not (FolderPath has_any (LegitPaths))
+| extend
+    AlertTitle = "System process running from unexpected location — possible masquerading",
+    Severity = "Medium",
+    MITRE = "T1036.005"
+| project
+    TimeGenerated,
+    DeviceName,
+    AccountName,
+    FileName,
+    FolderPath,
+    ProcessCommandLine,
+    InitiatingProcessFileName,
+    AlertTitle,
+    Severity,
+    MITRE
+
+// ============================================================
+// TUNING NOTES:
+//   - Extremely low legitimate FP rate. Legitimate system processes
+//     virtually always run from System32 or SysWOW64.
+//   - Some security tools may have processes with common names.
+//     Audit your environment and add known-good paths if needed.
+//
+// RESPONSE:
+//   1. Hash the suspicious file: Get-FileHash in PowerShell
+//   2. Submit hash to VirusTotal
+//   3. Identify who created/placed the file there
+//   4. Kill the process and delete the file
+//   5. Search for the same filename at non-standard paths across all devices
+// ============================================================

@@ -1,0 +1,182 @@
+// ============================================================
+// RULE: PE-001 — New Local Admin Account Created
+// ============================================================
+// MITRE ATT&CK:  T1136.001 — Create Account: Local Account
+// Severity:      🔴 HIGH
+// Data Source:   Security Events (Event ID 4720 + 4732)
+// Frequency:     Every 15 minutes | Lookback: 1 hour
+// Author:        Ismael Gaton
+// Description:
+//   Detects creation of a new local user account that is then
+//   added to the local Administrators group. A classic persistence
+//   technique — attackers create a backdoor admin account for
+//   re-entry. In SMEs, this is almost never a legitimate action.
+// ============================================================
+
+let AccountCreation = SecurityEvent
+| where TimeGenerated > ago(1h)
+| where EventID == 4720  // A user account was created
+| project
+    TimeGenerated,
+    Computer,
+    SubjectUserName,
+    TargetUserName,
+    EventID;
+
+let AddedToAdmins = SecurityEvent
+| where TimeGenerated > ago(1h)
+| where EventID == 4732  // Member added to security-enabled local group
+| where TargetUserName =~ "Administrators"
+| project
+    TimeGenerated,
+    Computer,
+    SubjectUserName,
+    MemberName,
+    EventID;
+
+AccountCreation
+| join kind=inner (AddedToAdmins) on Computer
+| where TargetUserName == MemberName or SubjectUserName == SubjectUserName1
+| extend
+    AlertTitle = "New local admin account created — possible persistence backdoor",
+    Severity = "High",
+    MITRE = "T1136.001"
+| project
+    TimeGenerated,
+    Computer,
+    SubjectUserName,
+    TargetUserName,
+    AlertTitle,
+    Severity,
+    MITRE
+
+// ============================================================
+// TUNING NOTES:
+//   - If IT regularly creates accounts this way, add their admin
+//     accounts to exclusion list:
+//     | where SubjectUserName !in ("it_admin", "helpdesk")
+//   - During onboarding periods, FPs may increase
+//
+// RESPONSE:
+//   1. Immediately disable the newly created account
+//   2. Identify who created it — was it an authorized IT action?
+//   3. If unauthorized, treat the host as compromised
+//   4. Check for other persistence mechanisms on the same host
+// ============================================================
+
+
+// ============================================================
+// RULE: PE-002 — Suspicious Scheduled Task Creation
+// ============================================================
+// MITRE ATT&CK:  T1053.005 — Scheduled Task/Job: Scheduled Task
+// Severity:      🟡 MEDIUM
+// Data Source:   Security Events (Event ID 4698), DeviceProcessEvents
+// Frequency:     Every 1 hour | Lookback: 1 hour
+// Author:        Ismael Gaton
+// Description:
+//   Detects new scheduled tasks created with suspicious command
+//   patterns — particularly those referencing PowerShell, scripts
+//   from temp directories, or encoded commands. Scheduled tasks
+//   are one of the most common persistence mechanisms.
+// ============================================================
+
+SecurityEvent
+| where TimeGenerated > ago(1h)
+| where EventID == 4698  // Scheduled task created
+| extend TaskXML = tostring(EventData)
+| where TaskXML has_any (
+    "powershell", "cmd.exe", "wscript", "cscript", "mshta",
+    "\\Temp\\", "\\AppData\\", "\\Users\\Public\\",
+    "http", "encoded", "bypass", "hidden"
+)
+| extend
+    AlertTitle = "Suspicious scheduled task created — possible persistence",
+    Severity = "Medium",
+    MITRE = "T1053.005"
+| project
+    TimeGenerated,
+    Computer,
+    SubjectUserName,
+    TaskXML,
+    AlertTitle,
+    Severity,
+    MITRE
+
+// ============================================================
+// TUNING NOTES:
+//   - Software installations often create scheduled tasks.
+//     After identifying known-good tasks, add their names to exclusion:
+//     | where TaskXML !has "GoogleUpdateTaskMachine"
+//   - Focus on tasks pointing to non-standard paths (Temp, AppData)
+//     as these are almost always suspicious
+//
+// RESPONSE:
+//   1. Review the full task XML to understand what it runs and when
+//   2. Delete the task if unauthorized
+//   3. Check if the task already executed (look for the process in DeviceProcessEvents)
+//   4. Search for the same task name across all devices in your environment
+// ============================================================
+
+
+// ============================================================
+// RULE: PE-003 — Registry Run Key Modified for Persistence
+// ============================================================
+// MITRE ATT&CK:  T1547.001 — Boot or Logon Autostart: Registry Run Keys
+// Severity:      🟡 MEDIUM
+// Data Source:   DeviceRegistryEvents
+// Frequency:     Every 1 hour | Lookback: 1 hour
+// Author:        Ismael Gaton
+// Description:
+//   Detects modifications to common Windows autostart registry keys.
+//   These keys execute programs on every user login and are heavily
+//   abused by malware for persistence.
+// ============================================================
+
+let AutostartKeys = dynamic([
+    "HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+    "HKEY_LOCAL_MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+    "HKEY_LOCAL_MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+    "HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+    "HKEY_LOCAL_MACHINE\\Software\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Run"
+]);
+
+DeviceRegistryEvents
+| where TimeGenerated > ago(1h)
+| where RegistryKey in~ (AutostartKeys)
+| where ActionType in ("RegistryValueSet", "RegistryKeyCreated")
+| where InitiatingProcessFileName !in~ (
+    "msiexec.exe", "setup.exe", "install.exe",
+    "OneDriveSetup.exe", "Teams.exe"
+)
+| extend
+    AlertTitle = "Registry autostart key modified — possible persistence mechanism",
+    Severity = "Medium",
+    MITRE = "T1547.001"
+| project
+    TimeGenerated,
+    DeviceName,
+    AccountName,
+    RegistryKey,
+    RegistryValueName,
+    RegistryValueData,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    AlertTitle,
+    Severity,
+    MITRE
+
+// ============================================================
+// TUNING NOTES:
+//   - Legitimate software installers WILL trigger this constantly.
+//     Build a baseline of known-good registry values in your env.
+//   - Focus on RegistryValueData pointing to unusual paths
+//     (Temp, AppData\Roaming, Public) as these are high confidence
+//   - Adding software = expected FPs. Focus on unexpected times
+//     (nights, weekends) or unexpected accounts
+//
+// RESPONSE:
+//   1. Check the RegistryValueData — what executable is it pointing to?
+//   2. Hash the executable and check VirusTotal
+//   3. If malicious: remove the registry entry AND delete the file
+//   4. Check if the executable already ran
+// ============================================================

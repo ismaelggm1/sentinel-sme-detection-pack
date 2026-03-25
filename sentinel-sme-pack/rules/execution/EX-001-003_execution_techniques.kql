@@ -1,0 +1,159 @@
+// ============================================================
+// RULE: EX-001 — PowerShell Encoded Command Execution
+// ============================================================
+// MITRE ATT&CK:  T1059.001 — Command and Scripting: PowerShell
+// Severity:      🔴 HIGH
+// Data Source:   Microsoft Defender for Endpoint (DeviceProcessEvents)
+// Frequency:     Every 30 minutes | Lookback: 1 hour
+// Author:        Ismael Gaton
+// Description:
+//   Detects PowerShell launched with encoded commands (-enc / -e flags).
+//   Attackers encode payloads to evade basic string-based detection.
+//   In SME environments, legitimate use of encoded PS is extremely rare.
+// ============================================================
+
+DeviceProcessEvents
+| where TimeGenerated > ago(1h)
+| where FileName =~ "powershell.exe" or FileName =~ "pwsh.exe"
+| where ProcessCommandLine has_any ("-enc", "-EncodedCommand", "-e ", "-ec ")
+| extend
+    IsBase64 = ProcessCommandLine matches regex @"[A-Za-z0-9+/]{50,}={0,2}",
+    AlertTitle = "PowerShell encoded command detected",
+    Severity = "High",
+    MITRE = "T1059.001"
+| project
+    TimeGenerated,
+    DeviceName,
+    AccountName,
+    ProcessCommandLine,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    FolderPath,
+    AlertTitle,
+    Severity,
+    MITRE
+
+// ============================================================
+// TUNING NOTES:
+//   - Legitimate RMM tools (ConnectWise, N-able) may use encoded PS.
+//     Exclude by initiating process:
+//     | where InitiatingProcessFileName !in~ ("connectwise.exe", "screenconnect.exe")
+//   - To decode the payload for triage, use CyberChef:
+//     Operations: From Base64 → Decode Text (UTF-16LE)
+//
+// RESPONSE:
+//   1. Decode the base64 payload and analyze intent
+//   2. Check what process launched PowerShell (parent process)
+//   3. Look for network connections made by that powershell.exe instance
+//   4. If malicious: isolate device, search for same command on other devices
+// ============================================================
+
+
+// ============================================================
+// RULE: EX-002 — Living Off the Land Binary (LOLBin) Abuse
+// ============================================================
+// MITRE ATT&CK:  T1218 — System Binary Proxy Execution
+// Severity:      🟡 MEDIUM
+// Data Source:   Microsoft Defender for Endpoint (DeviceProcessEvents)
+// Frequency:     Every 1 hour | Lookback: 1 hour
+// Author:        Ismael Gaton
+// Description:
+//   Detects abuse of legitimate Windows binaries to execute
+//   malicious code. LOLBins are trusted by security tools,
+//   making them a favorite for attackers in all environments.
+// ============================================================
+
+let LOLBins = dynamic([
+    "certutil.exe", "mshta.exe", "regsvr32.exe", "rundll32.exe",
+    "wmic.exe", "msiexec.exe", "installutil.exe", "cmstp.exe",
+    "msconfig.exe", "eudcedit.exe", "odbcconf.exe", "pcalua.exe",
+    "appvlp.exe", "dnscmd.exe", "wbadmin.exe", "desktopimgdownldr.exe"
+]);
+
+let SuspiciousKeywords = dynamic([
+    "http", "ftp", "download", "invoke", "webclient", "urlcache",
+    "decode", "-urlcache", "//", "javascript:", "vbscript:"
+]);
+
+DeviceProcessEvents
+| where TimeGenerated > ago(1h)
+| where FileName in~ (LOLBins)
+| where ProcessCommandLine has_any (SuspiciousKeywords)
+| extend
+    AlertTitle = "LOLBin used with suspicious argument — possible proxy execution",
+    Severity = "Medium",
+    MITRE = "T1218"
+| project
+    TimeGenerated,
+    DeviceName,
+    AccountName,
+    FileName,
+    ProcessCommandLine,
+    InitiatingProcessFileName,
+    FolderPath,
+    AlertTitle,
+    Severity,
+    MITRE
+
+// ============================================================
+// TUNING NOTES:
+//   - certutil.exe legitimately downloads CRL files. Exclude:
+//     | where not (FileName =~ "certutil.exe" and ProcessCommandLine has "crl")
+//   - msiexec.exe is used heavily by patch management tools.
+//     Exclude known patch management parent processes.
+//   - rundll32.exe calling printing or shell extensions is normal.
+//
+// RESPONSE:
+//   1. Identify what URL or file is being referenced
+//   2. Check if a file was dropped or downloaded
+//   3. Hash any dropped files and check VirusTotal
+//   4. Correlate with network logs to see if external connection was made
+// ============================================================
+
+
+// ============================================================
+// RULE: EX-003 — WMIC Spawning Suspicious Process
+// ============================================================
+// MITRE ATT&CK:  T1047 — Windows Management Instrumentation
+// Severity:      🔴 HIGH
+// Data Source:   DeviceProcessEvents
+// Frequency:     Every 30 minutes | Lookback: 1 hour
+// Author:        Ismael Gaton
+// Description:
+//   Detects WMIC used to spawn processes — a technique used for
+//   lateral movement and execution. WMIC is now deprecated but
+//   still present on many SME systems running older Windows versions.
+// ============================================================
+
+DeviceProcessEvents
+| where TimeGenerated > ago(1h)
+| where InitiatingProcessFileName =~ "wmiprvse.exe"
+| where FileName in~ ("powershell.exe", "cmd.exe", "wscript.exe",
+    "cscript.exe", "mshta.exe", "certutil.exe", "rundll32.exe")
+| extend
+    AlertTitle = "WMIC spawned suspicious child process",
+    Severity = "High",
+    MITRE = "T1047"
+| project
+    TimeGenerated,
+    DeviceName,
+    AccountName,
+    FileName,
+    ProcessCommandLine,
+    InitiatingProcessFileName,
+    FolderPath,
+    AlertTitle,
+    Severity,
+    MITRE
+
+// ============================================================
+// TUNING NOTES:
+//   - Some monitoring agents use WMI legitimately. Identify yours
+//     and exclude by DeviceName or AccountName if needed.
+//
+// RESPONSE:
+//   1. Identify who triggered the WMI call (remote or local)
+//   2. Check DeviceNetworkEvents for same device around same time
+//   3. Determine if this is lateral movement from another host
+//   4. Look for matching events on the originating host
+// ============================================================

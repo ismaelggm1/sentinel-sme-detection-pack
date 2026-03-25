@@ -1,0 +1,258 @@
+// ============================================================
+// RULE: EXFIL-001 — Large Data Upload to External Destination
+// ============================================================
+// MITRE ATT&CK:  T1048 — Exfiltration Over Alternative Protocol
+// Severity:      MEDIUM
+// Data Source:   DeviceNetworkEvents (MDE)
+// Frequency:     Every 1 hour | Lookback: 2 hours
+// Author:        Ismael Gaton
+//
+// Description:
+//   Detects unusually large outbound data transfers to external IPs.
+//   Attackers stage and exfiltrate data to cloud storage, paste sites,
+//   or C2 servers. Threshold is conservative for SME environments.
+//
+// FIELD NOTE: SentBytes and ReceivedBytes are not always populated in
+// DeviceNetworkEvents depending on your MDE version and OS. If this rule
+// returns no results, verify with:
+//   DeviceNetworkEvents | where isnotempty(SentBytes) | take 10
+// If empty, use Azure Firewall logs or NSG flow logs as an alternative.
+// ============================================================
+
+// --- CONFIGURATION ---
+let LookbackWindow = 2h;
+let ExfilThresholdBytes = 52428800;  // 50MB — lower for sensitive environments
+// Processes to exclude (backup agents, sync tools — add yours here)
+let ExcludedProcesses = dynamic([
+    "OneDrive.exe", "Teams.exe", "MicrosoftEdge.exe",
+    "msedge.exe", "chrome.exe", "firefox.exe",
+    "BackupAgent.exe", "veeam.exe"  // Add your backup agent here
+]);
+// --- END CONFIGURATION ---
+
+DeviceNetworkEvents
+| where TimeGenerated > ago(LookbackWindow)
+| where ActionType == "ConnectionSuccess"
+| where RemoteIPType == "Public"
+| where isnotempty(SentBytes)  // Only process rows where field is populated
+| where InitiatingProcessFileName !in~ (ExcludedProcesses)
+| summarize
+    TotalBytesSent = sum(SentBytes),
+    ConnectionCount = count(),
+    Destinations = make_set(RemoteIP, 10)
+    by DeviceName, InitiatingProcessFileName, InitiatingProcessAccountName
+| where TotalBytesSent > ExfilThresholdBytes
+| extend
+    TotalMBSent = round(todouble(TotalBytesSent) / 1048576.0, 2),
+    AlertTitle = "Large outbound data transfer — possible exfiltration",
+    Severity = "Medium",
+    MITRE_Tactic = "Exfiltration",
+    MITRE_Technique = "T1048"
+| project
+    DeviceName,
+    InitiatingProcessFileName,
+    InitiatingProcessAccountName,
+    TotalMBSent,
+    ConnectionCount,
+    Destinations,
+    AlertTitle,
+    Severity,
+    MITRE_Tactic,
+    MITRE_Technique
+| order by TotalMBSent desc
+
+// ============================================================
+// TUNING NOTES:
+//   - If SentBytes is not populated in your environment, this rule
+//     will not fire. See FIELD NOTE above for alternatives.
+//   - Focus on UNKNOWN processes with large transfers — those are
+//     high confidence. Browser transfers are usually benign.
+//   - Adjust ExfilThresholdBytes based on what's normal for your env:
+//     Run baseline: DeviceNetworkEvents | summarize sum(SentBytes) by DeviceName
+//
+// RESPONSE:
+//   1. Identify what process is sending and what files it accessed
+//      (correlate with DeviceFileEvents on same device/timeframe)
+//   2. Check destination IPs against threat intel (VirusTotal, Shodan)
+//   3. If destination is unknown: block at firewall, isolate device
+//   4. Estimate what data may have been sent — GDPR notification may apply
+// ============================================================
+
+
+// ============================================================
+// RULE: CC-001 — DNS Tunneling Detection
+// ============================================================
+// MITRE ATT&CK:  T1071.004 — Application Layer Protocol: DNS
+// Severity:      HIGH
+// Data Source:   DnsEvents (DNS connector — Preview)
+// Frequency:     Every 1 hour | Lookback: 2 hours
+// Author:        Ismael Gaton
+//
+// Description:
+//   Detects DNS tunneling — encoding C2 traffic inside DNS queries
+//   to bypass firewalls. Key indicators: very long subdomains,
+//   high query volume to same base domain, uncommon record types.
+// ============================================================
+
+// --- CONFIGURATION ---
+let LookbackWindow = 2h;
+let QueryLengthThreshold = 50;   // Characters — encoded data makes subdomains very long
+let QueryCountThreshold = 50;    // Queries to same base domain
+let MaxQueryLengthAlert = 100;   // Almost certainly tunneling if subdomain this long
+// --- END CONFIGURATION ---
+
+DnsEvents
+| where TimeGenerated > ago(LookbackWindow)
+| where isnotempty(Name)
+| extend QueryLength = strlen(Name)
+| where QueryLength > QueryLengthThreshold
+    or QueryType in ("TXT", "NULL", "PRIVATE")
+| extend
+    // Extract base domain (last two parts of FQDN)
+    DomainParts = split(Name, "."),
+    PartCount = array_length(split(Name, "."))
+| extend
+    BaseDomain = strcat(
+        tostring(split(Name, ".")[-2]), ".",
+        tostring(split(Name, ".")[-1])
+    )
+| summarize
+    QueryCount = count(),
+    UniqueDomains = dcount(Name),
+    AvgQueryLength = round(avg(QueryLength), 1),
+    MaxQueryLength = max(QueryLength),
+    SampleQueries = make_set(Name, 5)
+    by ClientIP, BaseDomain
+| where QueryCount > QueryCountThreshold or MaxQueryLength > MaxQueryLengthAlert
+| extend
+    AlertTitle = "Possible DNS tunneling — high volume or very long subdomain queries",
+    Severity = "High",
+    MITRE_Tactic = "Command and Control",
+    MITRE_Technique = "T1071.004"
+| project
+    ClientIP,
+    BaseDomain,
+    QueryCount,
+    UniqueDomains,
+    AvgQueryLength,
+    MaxQueryLength,
+    SampleQueries,
+    AlertTitle,
+    Severity,
+    MITRE_Tactic,
+    MITRE_Technique
+| order by MaxQueryLength desc
+
+// ============================================================
+// TUNING NOTES:
+//   - CDN services (Akamai, Fastly, Cloudflare) use long domain names.
+//     If specific CDN domains FP, add them to an exclusion list.
+//   - Some licensing checks use TXT records legitimately.
+//   - The HIGH VOLUME + LONG SUBDOMAIN + SAME BASE DOMAIN combination
+//     is the highest-confidence indicator. Single long queries are weaker.
+//
+// RESPONSE:
+//   1. Identify device from ClientIP
+//   2. Find process making DNS requests: DeviceNetworkEvents by RemotePort 53
+//   3. Block the destination domain at DNS resolver level
+//   4. The query content itself may contain encoded exfiltrated data
+//   5. Search same destination across all devices in your environment
+// ============================================================
+
+
+// ============================================================
+// RULE: CC-002 — C2 Beaconing (Regular Periodic Connections)
+// ============================================================
+// MITRE ATT&CK:  T1071.001 — Application Layer Protocol: Web Protocols
+// Severity:      HIGH
+// Data Source:   DeviceNetworkEvents (MDE)
+// Frequency:     Every 2 hours | Lookback: 6 hours
+// Author:        Ismael Gaton
+//
+// Description:
+//   Detects C2 beaconing — malware checking in with its command server
+//   at regular intervals. The very low variance in connection timing
+//   is what distinguishes beaconing from normal web traffic.
+//
+// PERFORMANCE NOTE: This rule uses array operations across 6 hours of data
+// and can be computationally heavy on workspaces with >500 devices.
+// If it times out, reduce LookbackWindow to 3h or add a device filter.
+// ============================================================
+
+// --- CONFIGURATION ---
+let LookbackWindow = 6h;
+let MinConnections = 10;         // Minimum check-ins to consider
+let MaxIntervalVarianceSeconds = 30;   // Lower = more regular = more suspicious
+let MinIntervalSeconds = 30;     // Ignore sub-30s connections (too noisy)
+let MaxIntervalSeconds = 3600;   // Ignore >1hr intervals
+// Processes known to beacon legitimately — add yours here
+let KnownBeaconingProcesses = dynamic([
+    "Teams.exe", "OneDrive.exe", "Outlook.exe", "MicrosoftEdge.exe",
+    "msedge.exe", "chrome.exe", "firefox.exe", "MsMpEng.exe",
+    "SenseIR.exe", "MsSense.exe"  // MDE sensor processes
+]);
+// --- END CONFIGURATION ---
+
+DeviceNetworkEvents
+| where TimeGenerated > ago(LookbackWindow)
+| where ActionType == "ConnectionSuccess"
+| where RemoteIPType == "Public"
+| where RemotePort in (80, 443, 8080, 8443, 4444, 1337, 8888)
+| where InitiatingProcessFileName !in~ (KnownBeaconingProcesses)
+| summarize
+    ConnectionTimes = make_list(TimeGenerated),
+    ConnectionCount = count(),
+    TotalBytesSent = sum(SentBytes),
+    RemoteIP = any(RemoteIP)
+    by DeviceName, InitiatingProcessFileName
+| where ConnectionCount >= MinConnections
+| extend SortedTimes = array_sort_asc(ConnectionTimes)
+| mv-apply with_itemindex=i SortedTimes to typeof(datetime) on
+(
+    extend PrevTime = iff(i > 0, prev(SortedTimes), datetime(null))
+    | where isnotempty(PrevTime)
+    | extend IntervalSeconds = datetime_diff('second', SortedTimes, PrevTime)
+    | where IntervalSeconds between (MinIntervalSeconds .. MaxIntervalSeconds)
+    | summarize
+        AvgIntervalSeconds = avg(IntervalSeconds),
+        StdDevInterval = stdev(IntervalSeconds),
+        ValidIntervals = count()
+)
+| where StdDevInterval < MaxIntervalVarianceSeconds
+| where ValidIntervals >= (MinConnections - 1)
+| extend
+    AvgIntervalMinutes = round(AvgIntervalSeconds / 60.0, 1),
+    AlertTitle = "Regular periodic outbound connections detected — possible C2 beaconing",
+    Severity = "High",
+    MITRE_Tactic = "Command and Control",
+    MITRE_Technique = "T1071.001"
+| project
+    DeviceName,
+    RemoteIP,
+    InitiatingProcessFileName,
+    ConnectionCount,
+    AvgIntervalMinutes,
+    StdDevInterval,
+    TotalBytesSent,
+    AlertTitle,
+    Severity,
+    MITRE_Tactic,
+    MITRE_Technique
+| order by StdDevInterval asc
+
+// ============================================================
+// TUNING NOTES:
+//   - If rule times out: reduce LookbackWindow to 3h, or add:
+//     | where DeviceName in ("device1", "device2")  // Focus on specific devices
+//   - AV products, update services, and telemetry agents all beacon.
+//     Expand KnownBeaconingProcesses with YOUR environment's legitimate tools.
+//   - The lowest StdDevInterval values are most suspicious — sort by it.
+//   - Correlate RemoteIP with VirusTotal or threat intel for confirmation.
+//
+// RESPONSE:
+//   1. Block the RemoteIP at firewall IMMEDIATELY
+//   2. Kill the beaconing process on the device
+//   3. Isolate the device — if it's beaconing, assume it's compromised
+//   4. Search for same RemoteIP across ALL devices in your environment
+//   5. Check TotalBytesSent — was data exfiltrated during the beaconing?
+// ============================================================

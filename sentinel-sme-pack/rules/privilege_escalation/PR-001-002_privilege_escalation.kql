@@ -1,0 +1,100 @@
+// ============================================================
+// RULE: PR-001 — UAC Bypass via Fodhelper
+// ============================================================
+// MITRE ATT&CK:  T1548.002 — Abuse Elevation Control Mechanism: Bypass UAC
+// Severity:      🔴 HIGH
+// Data Source:   DeviceProcessEvents, DeviceRegistryEvents
+// Frequency:     Every 30 minutes | Lookback: 1 hour
+// Author:        Ismael Gaton
+// Description:
+//   Detects the Fodhelper UAC bypass technique. This is one of the
+//   most commonly used UAC bypass methods in the wild. It abuses
+//   Windows Features on Demand Helper to auto-elevate and execute
+//   arbitrary commands without a UAC prompt.
+// ============================================================
+
+union
+(
+    // Registry key creation for Fodhelper bypass
+    DeviceRegistryEvents
+    | where TimeGenerated > ago(1h)
+    | where RegistryKey has @"Software\Classes\ms-settings\shell\open\command"
+    | where ActionType in ("RegistryValueSet", "RegistryKeyCreated")
+    | extend Source = "Fodhelper registry key"
+),
+(
+    // Fodhelper.exe spawning unexpected children
+    DeviceProcessEvents
+    | where TimeGenerated > ago(1h)
+    | where InitiatingProcessFileName =~ "fodhelper.exe"
+    | where FileName !in~ ("consent.exe", "fodhelper.exe")
+    | extend Source = "Fodhelper child process"
+)
+| extend
+    AlertTitle = "UAC bypass via Fodhelper detected — possible privilege escalation",
+    Severity = "High",
+    MITRE = "T1548.002"
+| project
+    TimeGenerated,
+    DeviceName,
+    AccountName,
+    Source,
+    AlertTitle,
+    Severity,
+    MITRE
+
+
+// ============================================================
+// RULE: PR-002 — Token Impersonation / Privilege Abuse
+// ============================================================
+// MITRE ATT&CK:  T1134.001 — Access Token Manipulation: Token Impersonation/Theft
+// Severity:      🔴 HIGH
+// Data Source:   DeviceProcessEvents
+// Frequency:     Every 1 hour | Lookback: 2 hours
+// Author:        Ismael Gaton
+// Description:
+//   Detects use of tools commonly used for token manipulation and
+//   privilege escalation. Tools like Incognito, JuicyPotato,
+//   PrintSpoofer, and RoguePotato are almost exclusively used
+//   during post-exploitation in SME environments.
+// ============================================================
+
+let TokenAbuseTool = dynamic([
+    "incognito", "juicypotato", "rottenpotato", "sweetpotato",
+    "printspoofer", "roguepotato", "badpotato", "godpotato",
+    "tokenvator", "impersonate"
+]);
+
+DeviceProcessEvents
+| where TimeGenerated > ago(2h)
+| where FileName has_any (TokenAbuseTool)
+    or ProcessCommandLine has_any (TokenAbuseTool)
+    or InitiatingProcessCommandLine has_any (TokenAbuseTool)
+| extend
+    AlertTitle = "Token manipulation tool detected — likely privilege escalation attempt",
+    Severity = "High",
+    MITRE = "T1134.001"
+| project
+    TimeGenerated,
+    DeviceName,
+    AccountName,
+    FileName,
+    ProcessCommandLine,
+    InitiatingProcessFileName,
+    FolderPath,
+    AlertTitle,
+    Severity,
+    MITRE
+
+// ============================================================
+// TUNING NOTES:
+//   - Near-zero legitimate use of these tools in SME environments.
+//   - Only exception: authorized penetration testing.
+//     Coordinate exclusions around test dates.
+//
+// RESPONSE:
+//   1. Treat as active attack — isolate immediately
+//   2. Identify what the tool was trying to impersonate
+//   3. Check if any elevated actions were taken after the tool ran
+//   4. Scope the compromise — look at what ran as SYSTEM afterward
+// ============================================================

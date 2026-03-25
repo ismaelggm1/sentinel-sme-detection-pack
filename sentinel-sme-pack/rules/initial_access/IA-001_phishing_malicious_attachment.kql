@@ -1,0 +1,58 @@
+// ============================================================
+// RULE: IA-001 — Phishing: Malicious Email Attachment Opened
+// ============================================================
+// MITRE ATT&CK:  T1566.001 — Spearphishing Attachment
+// Severity:      🔴 HIGH
+// Data Source:   Microsoft Defender for Office 365
+//                DeviceFileEvents, EmailEvents
+// Frequency:     Every 1 hour | Lookback: 1 hour
+// Author:        Ismael Gaton
+// Description:
+//   Detects when a user opens an email attachment that subsequently
+//   creates a suspicious child process (Office spawning cmd/powershell
+//   is a classic malware delivery pattern in SME environments).
+// ============================================================
+
+let suspiciousChildProcesses = dynamic([
+    "cmd.exe", "powershell.exe", "wscript.exe", "cscript.exe",
+    "mshta.exe", "rundll32.exe", "regsvr32.exe", "certutil.exe",
+    "bitsadmin.exe", "msiexec.exe"
+]);
+
+let officeProcesses = dynamic([
+    "winword.exe", "excel.exe", "powerpnt.exe", "outlook.exe",
+    "onenote.exe", "msaccess.exe"
+]);
+
+DeviceProcessEvents
+| where TimeGenerated > ago(1h)
+| where InitiatingProcessFileName in~ (officeProcesses)
+| where FileName in~ (suspiciousChildProcesses)
+| project
+    TimeGenerated,
+    DeviceName,
+    AccountName,
+    InitiatingProcessFileName,
+    FileName,
+    ProcessCommandLine,
+    InitiatingProcessCommandLine,
+    FolderPath
+| extend
+    AlertTitle = "Office application spawned suspicious child process",
+    Severity = "High",
+    MITRE = "T1566.001"
+
+// ============================================================
+// TUNING NOTES:
+//   - If rundll32.exe causes FPs, check if it's loading from
+//     a known software path like C:\Program Files\
+//   - Exclude known software update processes if needed:
+//     | where not (FileName == "msiexec.exe" and ProcessCommandLine has "update")
+//   - Legitimate macro-heavy environments may trigger this more often
+//
+// RESPONSE:
+//   1. Isolate the device immediately via MDE
+//   2. Check EmailEvents for the source email and sender
+//   3. Search for the attachment hash across all devices
+//   4. Block sender domain if confirmed malicious
+// ============================================================

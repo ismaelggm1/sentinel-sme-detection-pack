@@ -1,0 +1,185 @@
+// ============================================================
+// RULE: LM-001 — Pass-the-Hash Detection
+// ============================================================
+// MITRE ATT&CK:  T1550.002 — Use Alternate Authentication Material: Pass the Hash
+// Severity:      🔴 HIGH
+// Data Source:   Security Events (Event ID 4624)
+// Frequency:     Every 30 minutes | Lookback: 1 hour
+// Author:        Ismael Gaton
+// Description:
+//   Detects Pass-the-Hash authentication — identified by NTLM
+//   network logon (Type 3) with a blank password field and
+//   no Kerberos SPN. This is the signature of PtH attacks
+//   used for lateral movement after credential dumping.
+// ============================================================
+
+SecurityEvent
+| where TimeGenerated > ago(1h)
+| where EventID == 4624  // Successful logon
+| where LogonType == 3  // Network logon
+| where AuthenticationPackageName =~ "NTLM"
+| where WorkstationName != Computer  // Remote auth, not local
+| where AccountName != "ANONYMOUS LOGON"
+| where AccountName !endswith "$"  // Exclude machine accounts
+| where LmPackageName =~ "NTLM V2"
+| summarize
+    LogonCount = count(),
+    TargetMachines = make_set(Computer),
+    SourceMachines = make_set(WorkstationName),
+    FirstSeen = min(TimeGenerated),
+    LastSeen = max(TimeGenerated)
+    by AccountName, IpAddress
+| where array_length(TargetMachines) > 2  // Hitting multiple machines
+| extend
+    AlertTitle = "Possible Pass-the-Hash — NTLM lateral movement across multiple hosts",
+    Severity = "High",
+    MITRE = "T1550.002"
+| project
+    FirstSeen,
+    LastSeen,
+    AccountName,
+    IpAddress,
+    LogonCount,
+    TargetMachines,
+    SourceMachines,
+    AlertTitle,
+    Severity,
+    MITRE
+
+// ============================================================
+// TUNING NOTES:
+//   - Backup agents and monitoring tools often use NTLM across
+//     multiple machines. Identify them and exclude by AccountName.
+//   - Reduce the TargetMachines threshold to 1 in high-security
+//     environments where lateral movement is strictly controlled.
+//   - This pairs well with CA-001 (LSASS dump) — if both fire on
+//     same timeframe, treat as confirmed attack chain.
+//
+// RESPONSE:
+//   1. Identify the source machine — that's the compromised host
+//   2. Isolate source machine immediately
+//   3. All target machines should be treated as potentially compromised
+//   4. Reset password for the affected account
+//   5. Check what was accessed on the target machines
+// ============================================================
+
+
+// ============================================================
+// RULE: LM-002 — Abnormal RDP Lateral Movement
+// ============================================================
+// MITRE ATT&CK:  T1021.001 — Remote Services: Remote Desktop Protocol
+// Severity:      🟡 MEDIUM
+// Data Source:   Security Events, DeviceNetworkEvents
+// Frequency:     Every 1 hour | Lookback: 2 hours
+// Author:        Ismael Gaton
+// Description:
+//   Detects RDP connections from workstations to other workstations.
+//   In SMEs, RDP from workstation-to-workstation is almost never
+//   legitimate — admins use jump hosts or VPN. This pattern strongly
+//   indicates lateral movement.
+// ============================================================
+
+DeviceNetworkEvents
+| where TimeGenerated > ago(2h)
+| where RemotePort == 3389  // RDP
+| where ActionType == "ConnectionSuccess"
+| where not (DeviceName has_any ("server", "srv", "dc", "jump", "rdp"))
+| where not (RemoteUrl has_any ("server", "srv", "dc", "jump", "rdp"))
+| summarize
+    Connections = count(),
+    TargetHosts = make_set(RemoteUrl),
+    TargetIPs = make_set(RemoteIP)
+    by DeviceName, InitiatingProcessAccountName
+| where array_length(TargetHosts) >= 2 or Connections >= 5
+| extend
+    AlertTitle = "Workstation-to-workstation RDP — possible lateral movement",
+    Severity = "Medium",
+    MITRE = "T1021.001"
+| project
+    DeviceName,
+    InitiatingProcessAccountName,
+    Connections,
+    TargetHosts,
+    TargetIPs,
+    AlertTitle,
+    Severity,
+    MITRE
+
+// ============================================================
+// TUNING NOTES:
+//   - Adjust the server/jump host exclusion list to match your
+//     naming conventions (e.g., if your DCs are named "AD-01")
+//   - IT helpdesk doing remote support will trigger this —
+//     exclude their accounts:
+//     | where InitiatingProcessAccountName !in~ ("helpdesk", "itsupport")
+//   - Single RDP connection is not always suspicious — threshold
+//     can be lowered in environments where RDP is strictly controlled
+//
+// RESPONSE:
+//   1. Contact the source user — are they doing legitimate IT work?
+//   2. If unexpected, check what processes ran on both hosts during that time
+//   3. Look for post-exploitation activity (new accounts, data staging)
+//   4. Consider blocking workstation-to-workstation RDP via firewall policy
+// ============================================================
+
+
+// ============================================================
+// RULE: LM-003 — SMB Lateral Movement (PsExec / Admin Shares)
+// ============================================================
+// MITRE ATT&CK:  T1021.002 — Remote Services: SMB/Windows Admin Shares
+// Severity:      🔴 HIGH
+// Data Source:   Security Events (Event ID 4648, 5140)
+// Frequency:     Every 30 minutes | Lookback: 1 hour
+// Author:        Ismael Gaton
+// Description:
+//   Detects access to administrative shares (C$, ADMIN$, IPC$)
+//   combined with explicit credential use — the pattern used by
+//   PsExec, Impacket, and similar lateral movement tools.
+// ============================================================
+
+let AdminShares = dynamic(["\\\\*\\C$", "\\\\*\\ADMIN$", "\\\\*\\IPC$"]);
+
+SecurityEvent
+| where TimeGenerated > ago(1h)
+| where EventID == 5140  // Network share accessed
+| where ShareName in~ ("\\\\*\\C$", "\\\\*\\ADMIN$", "\\\\*\\IPC$")
+    or ShareName has "ADMIN$"
+    or ShareName has "C$"
+| where AccountName != "ANONYMOUS LOGON"
+| where AccountName !endswith "$"
+| join kind=leftouter (
+    SecurityEvent
+    | where TimeGenerated > ago(1h)
+    | where EventID == 4648  // Logon using explicit credentials
+    | project TimeGenerated, Computer, AccountName, TargetServerName
+) on Computer, AccountName
+| extend
+    AlertTitle = "Admin share accessed with explicit credentials — possible PsExec/lateral movement",
+    Severity = "High",
+    MITRE = "T1021.002"
+| project
+    TimeGenerated,
+    Computer,
+    AccountName,
+    ShareName,
+    IpAddress,
+    AlertTitle,
+    Severity,
+    MITRE
+| distinct *
+
+// ============================================================
+// TUNING NOTES:
+//   - Domain admins legitimately access admin shares.
+//     Exclude by AccountName if you have a named admin account.
+//   - Backup software frequently accesses C$ — exclude backup
+//     service account names.
+//   - The combination of 4648 + 5140 reduces FPs significantly
+//     vs just monitoring 5140 alone
+//
+// RESPONSE:
+//   1. Identify source IP and correlate with a hostname
+//   2. Was a service installed on the target? Check Event ID 7045
+//   3. Check for PsExec service name: "PSEXESVC"
+//   4. If confirmed: isolate both source and target machines
+// ============================================================
